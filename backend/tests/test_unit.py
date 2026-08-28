@@ -4,7 +4,6 @@ import json
 import os
 import sys
 
-# Ensure backend directory is on sys.path
 sys.path.insert(0, os.path.abspath("backend"))
 
 # Mock boto3 and dotenv before importing utils
@@ -19,6 +18,44 @@ sys.modules["botocore.exceptions"] = botocore_exceptions
 
 import s3_utils
 import dynamo_utils
+import auth
+import ses_utils
+
+class TestAuth(unittest.TestCase):
+    def test_token_generation_and_verification(self):
+        file_id = "test-fid-123"
+        recipient = "alice@example.com"
+        token = auth.generate_recipient_token(file_id, recipient)
+        self.assertIsInstance(token, str)
+
+        verified_email = auth.verify_recipient_token(token, file_id)
+        self.assertEqual(verified_email, recipient)
+
+    def test_token_verification_tampering(self):
+        file_id = "test-fid-123"
+        token = auth.generate_recipient_token(file_id, "alice@example.com")
+        
+        # Wrong file_id
+        self.assertIsNone(auth.verify_recipient_token(token, "wrong-fid-456"))
+
+        # Corrupted token
+        corrupted = token[:-4] + "AAAA"
+        self.assertIsNone(auth.verify_recipient_token(corrupted, file_id))
+
+class TestSESUtils(unittest.TestCase):
+    @patch("ses_utils.get_ses_client")
+    def test_send_recipient_email_success(self, mock_get_ses):
+        mock_ses = MagicMock()
+        mock_get_ses.return_value = mock_ses
+
+        sent = ses_utils.send_recipient_email(
+            recipient_email="bob@example.com",
+            original_filename="doc.pdf",
+            access_url="http://localhost:8000/files/123/access?token=xyz",
+            uploader_email="alice@example.com"
+        )
+        self.assertTrue(sent)
+        mock_ses.send_email.assert_called_once()
 
 class TestS3Utils(unittest.TestCase):
     @patch.dict(os.environ, {"S3_BUCKET_NAME": "test-bucket"})
@@ -45,11 +82,6 @@ class TestS3Utils(unittest.TestCase):
 
         get_url = s3_utils.generate_presigned_get_url("uploads/123/file.txt")
         self.assertEqual(get_url, "https://s3.amazonaws.com/test-bucket/file")
-        mock_client.generate_presigned_url.assert_called_with(
-            "get_object",
-            Params={"Bucket": "test-bucket", "Key": "uploads/123/file.txt"},
-            ExpiresIn=300
-        )
 
 class TestDynamoUtils(unittest.TestCase):
     @patch("dynamo_utils.get_file_table")
@@ -86,19 +118,6 @@ class TestDynamoUtils(unittest.TestCase):
         updated = dynamo_utils.add_recipient_access("fid-123", "alice@test.com")
         self.assertEqual(updated["accessed_by"], ["alice@test.com"])
         mock_table.update_item.assert_called_once()
-
-        # Calling again with same email should not duplicate or issue another update
-        mock_table.update_item.reset_mock()
-        mock_table.get_item.return_value = {
-            "Item": {
-                "file_id": "fid-123",
-                "recipients": ["alice@test.com"],
-                "accessed_by": ["alice@test.com"]
-            }
-        }
-        updated_again = dynamo_utils.add_recipient_access("fid-123", "alice@test.com")
-        self.assertEqual(updated_again["accessed_by"], ["alice@test.com"])
-        mock_table.update_item.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,7 +2,8 @@
 title: "1.2 Per-Recipient Cryptographic Token Generation & SES Email Notification"
 type: "feature"
 created: "2026-08-28"
-status: "draft"
+baseline_commit: "e89c8c5"
+status: "done"
 review_loop_iteration: 0
 context:
   - "{project-root}/AGENTS.md"
@@ -51,10 +52,10 @@ context:
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `backend/auth.py` -- Implement HMAC-SHA256 token helpers -- Provide `generate_recipient_token` and `verify_recipient_token`
-- [ ] `backend/ses_utils.py` -- Implement SES email dispatch module -- Provide `send_recipient_email` with HTML and text templates
-- [ ] `backend/main.py` -- Integrate token generation and SES dispatch into upload route -- Store `recipient_tokens` in DynamoDB and fire notifications
-- [ ] `backend/tests/test_ses_tokens.py` -- Add automated test suite -- Verify token security, signature validation, and mocked SES email dispatch
+- [x] `backend/auth.py` -- Implement HMAC-SHA256 token helpers -- Provide `generate_recipient_token` and `verify_recipient_token`
+- [x] `backend/ses_utils.py` -- Implement SES email dispatch module -- Provide `send_recipient_email` with HTML and text templates
+- [x] `backend/main.py` -- Integrate token generation and SES dispatch into upload route -- Store `recipient_tokens` in DynamoDB and fire notifications
+- [x] `backend/tests/test_ses_tokens.py` -- Add automated test suite -- Verify token security, signature validation, and mocked SES email dispatch
 
 **Acceptance Criteria:**
 - Given a file upload with recipient emails, when `POST /files/upload` is processed, then a unique signed token is generated for each recipient email and saved in `recipient_tokens` in DynamoDB.
@@ -70,3 +71,25 @@ Token format: `base64url(recipient_email + ":" + file_id + ":" + timestamp + ":"
 
 **Commands:**
 - `python3 backend/tests/test_unit.py` -- expected: All unit tests pass.
+
+## Suggested Review Order
+
+**Token Cryptography & Verification**
+
+- HMAC-SHA256 token signing and tamper-proof verification helpers
+  [`auth.py:10`](../../backend/auth.py#L10)
+
+**Email Notification Dispatch**
+
+- AWS SES client dispatch with HTML/text templates and error handling
+  [`ses_utils.py:19`](../../backend/ses_utils.py#L19)
+
+**Route Integration**
+
+- Upload endpoint integration generating tokens and dispatching emails
+  [`main.py:65`](../../backend/main.py#L65)
+
+**Automated Tests**
+
+- Unit test suite verifying token generation, tampering, and SES dispatch
+  [`test_unit.py:18`](../../backend/tests/test_unit.py#L18)

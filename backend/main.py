@@ -1,8 +1,9 @@
 import os
 import uuid
 import json
+import logging
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import List, Dict, Optional
 
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,8 +12,12 @@ from dotenv import load_dotenv
 
 from s3_utils import upload_file_to_s3
 from dynamo_utils import create_file_metadata, get_file_metadata
+from auth import generate_recipient_token, verify_recipient_token
+from ses_utils import send_recipient_email
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="CloudShare Secure API", version="1.0.0")
 
@@ -32,6 +37,7 @@ class UploadResponse(BaseModel):
     uploaded_at: str
     recipients: List[str]
     s3_key: str
+    recipient_links: Dict[str, str]
 
 @app.get("/health")
 def health_check():
@@ -74,11 +80,21 @@ async def upload_file(
     content_type = file.content_type or "application/octet-stream"
     uploaded_at = datetime.now(timezone.utc).isoformat()
 
+    # Generate per-recipient signed access tokens
+    recipient_tokens: Dict[str, str] = {}
+    recipient_links: Dict[str, str] = {}
+    base_app_url = os.getenv("APP_BASE_URL", "http://localhost:8000")
+
+    for email in recipient_list:
+        token = generate_recipient_token(file_id=file_id, recipient_email=email)
+        recipient_tokens[email] = token
+        recipient_links[email] = f"{base_app_url}/files/{file_id}/access?token={token}"
+
     try:
         # Upload to S3
         upload_file_to_s3(file_bytes, s3_key, content_type)
 
-        # Save metadata in DynamoDB
+        # Save metadata in DynamoDB with recipient_tokens mapping
         create_file_metadata(
             file_id=file_id,
             s3_key=s3_key,
@@ -88,8 +104,17 @@ async def upload_file(
             content_type=content_type,
             recipients=recipient_list,
             uploaded_at=uploaded_at,
-            recipient_tokens={}
+            recipient_tokens=recipient_tokens
         )
+
+        # Dispatch SES emails to recipients
+        for email, link in recipient_links.items():
+            send_recipient_email(
+                recipient_email=email,
+                original_filename=original_filename,
+                access_url=link,
+                uploader_email=uploader_email
+            )
 
         return UploadResponse(
             file_id=file_id,
@@ -98,9 +123,11 @@ async def upload_file(
             content_type=content_type,
             uploaded_at=uploaded_at,
             recipients=recipient_list,
-            s3_key=s3_key
+            s3_key=s3_key,
+            recipient_links=recipient_links
         )
     except Exception as e:
+        logger.exception("Upload processing error")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Upload failed: {str(e)}"

@@ -6,12 +6,13 @@ from datetime import datetime, timezone
 from typing import List, Dict, Optional
 
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, status
+from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-from s3_utils import upload_file_to_s3
-from dynamo_utils import create_file_metadata, get_file_metadata
+from s3_utils import upload_file_to_s3, generate_presigned_get_url
+from dynamo_utils import create_file_metadata, get_file_metadata, add_recipient_access
 from auth import generate_recipient_token, verify_recipient_token
 from ses_utils import send_recipient_email
 
@@ -38,6 +39,15 @@ class UploadResponse(BaseModel):
     recipients: List[str]
     s3_key: str
     recipient_links: Dict[str, str]
+
+class AccessResponse(BaseModel):
+    file_id: str
+    original_filename: str
+    size_bytes: int
+    content_type: str
+    download_url: str
+    recipient_email: str
+    access_recorded: bool
 
 @app.get("/health")
 def health_check():
@@ -132,3 +142,45 @@ async def upload_file(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Upload failed: {str(e)}"
         )
+
+@app.get("/files/{file_id}/access", response_model=AccessResponse)
+async def access_file(
+    file_id: str,
+    token: str,
+    redirect: bool = False
+):
+    # 1. Fetch file metadata
+    metadata = get_file_metadata(file_id)
+    if not metadata:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File not found or has already been deleted"
+        )
+
+    # 2. Verify token
+    recipient_email = verify_recipient_token(token, file_id)
+    if not recipient_email or recipient_email not in metadata.get("recipients", []):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid, expired, or tampered access token"
+        )
+
+    # 3. Idempotently record access in DynamoDB
+    add_recipient_access(file_id, recipient_email)
+
+    # 4. Generate short-lived presigned GET URL
+    s3_key = metadata["s3_key"]
+    download_url = generate_presigned_get_url(s3_key, expires_in=300)
+
+    if redirect:
+        return RedirectResponse(url=download_url, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+
+    return AccessResponse(
+        file_id=file_id,
+        original_filename=metadata.get("original_filename", "downloaded_file"),
+        size_bytes=int(metadata.get("size_bytes", 0)),
+        content_type=metadata.get("content_type", "application/octet-stream"),
+        download_url=download_url,
+        recipient_email=recipient_email,
+        access_recorded=True
+    )

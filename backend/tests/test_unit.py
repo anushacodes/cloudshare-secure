@@ -1,12 +1,12 @@
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, AsyncMock
 import json
 import os
 import sys
 
 sys.path.insert(0, os.path.abspath("backend"))
 
-# Mock boto3 and dotenv before importing utils
+# Mock external packages before imports
 sys.modules["boto3"] = MagicMock()
 sys.modules["dotenv"] = MagicMock()
 botocore_exceptions = MagicMock()
@@ -16,10 +16,49 @@ botocore_exceptions.ClientError = ClientError
 sys.modules["botocore"] = MagicMock()
 sys.modules["botocore.exceptions"] = botocore_exceptions
 
+# Mock fastapi
+class HTTPException(Exception):
+    def __init__(self, status_code, detail):
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(detail)
+
+class FastAPIMock:
+    HTTPException = HTTPException
+    def __init__(self, *args, **kwargs):
+        pass
+    def add_middleware(self, *args, **kwargs):
+        pass
+    def get(self, *args, **kwargs):
+        return lambda f: f
+    def post(self, *args, **kwargs):
+        return lambda f: f
+
+class StatusMock:
+    HTTP_400_BAD_REQUEST = 400
+    HTTP_401_UNAUTHORIZED = 401
+    HTTP_403_FORBIDDEN = 403
+    HTTP_404_NOT_FOUND = 404
+    HTTP_500_INTERNAL_SERVER_ERROR = 500
+    HTTP_307_TEMPORARY_REDIRECT = 307
+
+fastapi_module = MagicMock()
+fastapi_module.FastAPI = FastAPIMock
+fastapi_module.HTTPException = HTTPException
+fastapi_module.status = StatusMock()
+fastapi_module.File = lambda *a, **kw: None
+fastapi_module.Form = lambda *a, **kw: None
+fastapi_module.UploadFile = MagicMock()
+
+sys.modules["fastapi"] = fastapi_module
+sys.modules["fastapi.responses"] = MagicMock()
+sys.modules["fastapi.middleware.cors"] = MagicMock()
+
 import s3_utils
 import dynamo_utils
 import auth
 import ses_utils
+import main
 
 class TestAuth(unittest.TestCase):
     def test_token_generation_and_verification(self):
@@ -118,6 +157,52 @@ class TestDynamoUtils(unittest.TestCase):
         updated = dynamo_utils.add_recipient_access("fid-123", "alice@test.com")
         self.assertEqual(updated["accessed_by"], ["alice@test.com"])
         mock_table.update_item.assert_called_once()
+
+import asyncio
+
+class TestAccessEndpoint(unittest.TestCase):
+    @patch("main.get_file_metadata")
+    @patch("main.add_recipient_access")
+    @patch("main.generate_presigned_get_url")
+    def test_access_file_success(self, mock_get_url, mock_add_access, mock_get_meta):
+        file_id = "fid-123"
+        recipient = "alice@example.com"
+        token = auth.generate_recipient_token(file_id, recipient)
+        
+        mock_get_meta.return_value = {
+            "file_id": file_id,
+            "original_filename": "presentation.pdf",
+            "size_bytes": 2048,
+            "content_type": "application/pdf",
+            "s3_key": "uploads/fid-123/presentation.pdf",
+            "recipients": [recipient],
+            "accessed_by": []
+        }
+        mock_get_url.return_value = "https://s3.amazonaws.com/test-bucket/uploads/fid-123/presentation.pdf"
+
+        res = asyncio.run(main.access_file(file_id=file_id, token=token))
+        self.assertEqual(res.file_id, file_id)
+        self.assertEqual(res.original_filename, "presentation.pdf")
+        self.assertEqual(res.recipient_email, recipient)
+        self.assertEqual(res.download_url, "https://s3.amazonaws.com/test-bucket/uploads/fid-123/presentation.pdf")
+        mock_add_access.assert_called_once_with(file_id, recipient)
+
+    @patch("main.get_file_metadata")
+    def test_access_file_not_found(self, mock_get_meta):
+        mock_get_meta.return_value = None
+        with self.assertRaises(HTTPException) as ctx:
+            asyncio.run(main.access_file(file_id="non-existent", token="any"))
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    @patch("main.get_file_metadata")
+    def test_access_file_invalid_token(self, mock_get_meta):
+        mock_get_meta.return_value = {
+            "file_id": "fid-123",
+            "recipients": ["alice@example.com"]
+        }
+        with self.assertRaises(HTTPException) as ctx:
+            asyncio.run(main.access_file(file_id="fid-123", token="invalid-token"))
+        self.assertEqual(ctx.exception.status_code, 403)
 
 if __name__ == "__main__":
     unittest.main()
